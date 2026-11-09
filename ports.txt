@@ -1,0 +1,17 @@
+ls -l /dev/serial/by-id/
+
+usb-1a86_USB_Single_Serial_58B0000834-if00                  -> ../../ttyACM2
+usb-Arduino_Srl_Arduino_Uno_75437303830351A02171-if00       -> ../../ttyACM1
+usb-Arduino_Srl_Arduino_Uno_85438333236351112162-if00       -> ../../ttyACM0
+usb-Arduino__www.arduino.cc__0043_5583332383935120E122-if00 -> ../../ttyACM3
+
+
+ ls -l /dev/ttyACM1*
+
+crw-rw-rw- 1 root dialout 166, 1 Nov  5 21:40 /dev/ttyACM1
+lrwxrwxrwx 1 root root         7 Nov  5 21:40 /dev/ttyACM10 -> ttyACM1
+lrwxrwxrwx 1 root root         7 Nov  5 21:40 /dev/ttyACM11 -> ttyACM0
+lrwxrwxrwx 1 root root         7 Nov  5 22:20 /dev/ttyACM12 -> ttyACM3
+lrwxrwxrwx 1 root root         7 Nov  5 21:40 /dev/ttyACM13 -> ttyACM2
+
+
