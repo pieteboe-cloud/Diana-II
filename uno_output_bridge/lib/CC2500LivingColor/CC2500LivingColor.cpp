@@ -467,7 +467,7 @@ void CC2500LivingColor::sendPacket(uint8_t lampIndex, uint8_t command,
     SPI.transfer(CC2500_REG_TXFIFO | CC2500_OFF_WRITE_BURST);  // 0x7F
 
     for (uint8_t i = 0; i < FIFO_PACKET_SIZE; ++i) {
-                delayMicroseconds(150);  // chip needs ~128 µs to finish reset
+                //delayMicroseconds(250); //expirimantal delay   
 
         SPI.transfer(packet[i]);
     }
@@ -530,7 +530,7 @@ void CC2500LivingColor::runStartupColorSequence() {
 
     // Phase 2: all lamps to random color
     for (uint8_t i = 0; i < LAMP_COUNT; ++i) {
-        sendPacket(i, 0x03, static_cast<uint8_t>(random(256)), 255, 100);
+        sendPacket(i, 0x03, static_cast<uint8_t>(random(256)), 255, 50);
         delay(PAUSE_MS);
     }
 }

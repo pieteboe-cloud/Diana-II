@@ -29,15 +29,10 @@
 // WIRING
 //
 //   CC2500:  CS=10, SCK=13, MOSI=11, GDO0=2 (int), GDO2→LED (open-drain)
-//   RF:      A2 (16) → RF module data pin
-//   IR:      A1 (15) → IR blaster data pin
-//   LED OK:  A0 (14) → green LED (220Ω to 5V)
-//   LED ERR: A1... wait, A1 is IR. Let's use A4 (18) for ERR.
-//
-//   Actually:
-//   LED OK:  A0 (14) → green
-//   LED ERR: A4 (18) → red
-//
+//   IR:      A0 (14) → IR blaster data pin
+//   RF:      A1 (15) → RF module data pin
+//   LED OK:  A2 (16) → green LED (220Ω to 5V)  heartbeat when ready
+//   LED ERR: A3 (17) → red LED (220Ω to 5V)    solid=fail, flash=busy
 // ============================================================================
 
 #include <Arduino.h>
@@ -54,35 +49,39 @@ void handleLampFrame(char* data);
 void handleIR(char* hexStr);
 void handleRF(char* hexStr);
 
+// Mark the red "busy" LED as active for a short flash.
+void setBusy(unsigned long ms);
+
 // ============================================================================
 // PIN DEFINITIONS
 // ============================================================================
 
-// --- CC2500 (radio to Living Color lamps) ---
+// --- CC2500 ,RF ,IR Arduino UNO pins 
 // SPI pins are fixed by Uno hardware: SCK=13, MOSI=11, MISO=12
 // CS is configurable, GDO0 is hardcoded in the library (pin 2)
+// A0-A5 are used as digital pins 14-19 on the Uno
 constexpr uint8_t CC2500_CS_PIN = 10;
-
-// --- RF transmitter (433 MHz, rc-switch) ---
-constexpr uint8_t RF_TRANSMIT_PIN = 16;   // A2
-
-// --- IR transmitter (38 kHz, IRremote) ---
-constexpr uint8_t IR_TRANSMIT_PIN = 15;   // A1
-
-// --- Status LEDs ---
-constexpr uint8_t LED_OK_PIN  = 14;       // A0 — green: all systems initialized
-constexpr uint8_t LED_ERR_PIN = 18;       // A4 — red: CC2500 not found
+constexpr uint8_t IR_TRANSMIT_PIN = 14;   // A0
+constexpr uint8_t RF_TRANSMIT_PIN = 4;   // 
+constexpr uint8_t LED_OK_PIN  = 16;       // A2 — green: heartbeat when ready
+constexpr uint8_t LED_ERR_PIN = 17;       // A3 — red: solid=fail, flash=busy
 
 // ============================================================================
 // PROTOCOL CONSTANTS
 // ============================================================================
 
-// Line buffer size: "O,LAMP," + 12×3 values + 11 commas + "\n" ≈ 80 bytes
-// Add margin for future commands
-constexpr uint16_t LINE_BUFFER_SIZE = 128;
+// Line buffer size: "O,LAMP," + 12×3 values + 11 commas + "\n" ≈ 151 bytes.
+// 192 gives headroom for the full frame plus future commands.
+constexpr uint16_t LINE_BUFFER_SIZE = 192;
 
 // Lamp count (from the radio library)
 constexpr uint8_t LAMP_COUNT = CC2500LivingColor::LAMP_COUNT;
+
+// Heartbeat period for the green OK LED (milliseconds per full blink cycle).
+constexpr unsigned long HEARTBEAT_MS = 1000;
+
+// How long the red ERR LED stays on for each busy flash (milliseconds).
+constexpr unsigned long BUSY_FLASH_MS = 80;
 
 // ============================================================================
 // OBJECTS & STATE
@@ -98,15 +97,56 @@ bool radioReady = false;    // true once CC2500 is verified and initialized
 char lineBuffer[LINE_BUFFER_SIZE] = {};
 uint16_t lineLen = 0;
 
+// Green heartbeat state
+unsigned long lastHeartbeatToggle = 0;
+bool heartbeatOn = false;
+
+// Red busy-flash state
+unsigned long busyUntil = 0;
+
 // ============================================================================
-// RF/IR TEST TIMING (only used when the test block is uncommented)
+// LED HELPERS
 // ============================================================================
 
-constexpr unsigned long RF_INTERVAL_MS  = 12000;   // fire every 12 s
-constexpr unsigned long RF_OFF_DELAY_MS = 5000;    // turn off after 5 s
-unsigned long lastRfTime = 0;
-bool rfPendingOff = false;
-unsigned long rfOffAt = 0;
+// Call this whenever the Uno is doing work (UART command, RF, IR, CC2500).
+// The red LED will stay on for BUSY_FLASH_MS milliseconds.
+void setBusy(unsigned long ms) {
+    busyUntil = millis() + ms;
+    digitalWrite(LED_ERR_PIN, HIGH);
+}
+
+// Update both LEDs non-blockingly. Call from loop() every iteration.
+void updateLeds() {
+    const unsigned long now = millis();
+
+    // ---- Green OK LED: heartbeat ----
+    if (radioReady) {
+        // Toggle every half-period so a full blink takes HEARTBEAT_MS.
+        if (now - lastHeartbeatToggle >= HEARTBEAT_MS / 2) {
+            heartbeatOn = !heartbeatOn;
+            digitalWrite(LED_OK_PIN, heartbeatOn ? HIGH : LOW);
+            lastHeartbeatToggle = now;
+        }
+    } else {
+        // Not ready: blink red fast to show CC2500 is missing.
+        if (now - lastHeartbeatToggle >= 150) {
+            heartbeatOn = !heartbeatOn;
+            digitalWrite(LED_ERR_PIN, heartbeatOn ? HIGH : LOW);
+            lastHeartbeatToggle = now;
+        }
+        // Keep green off while in error state.
+        digitalWrite(LED_OK_PIN, LOW);
+        return;
+    }
+
+    // ---- Red ERR LED: busy flash ----
+    // Only touch the red pin if we are not in the fast-error blink above.
+    if (now < busyUntil) {
+        digitalWrite(LED_ERR_PIN, HIGH);
+    } else {
+        digitalWrite(LED_ERR_PIN, LOW);
+    }
+}
 
 // ============================================================================
 // LINE PARSER
@@ -129,6 +169,7 @@ void receiveCommands() {
             lineBuffer[lineLen] = '\0';
             processLine(lineBuffer);
             lineLen = 0;
+            setBusy(BUSY_FLASH_MS);   // flash red: a command arrived
         } else if (c == '\r') {
             // Ignore carriage returns (in case ESP32 sends \r\n)
         } else if (lineLen < LINE_BUFFER_SIZE - 1) {
@@ -209,6 +250,7 @@ void handleLampFrame(char* data) {
     }
 
     // Send all 12 lamps back-to-back (9.6 ms total air time)
+    setBusy(BUSY_FLASH_MS);   // flash red: CC2500 is transmitting
     radio.sendFrame(hue, sat, val);
 }
 
@@ -221,6 +263,7 @@ void handleLampFrame(char* data) {
 
 void handleIR(char* hexStr) {
     uint32_t code = (uint32_t)strtoul(hexStr, nullptr, 16);
+    setBusy(BUSY_FLASH_MS);   // flash red: IR is transmitting
     ir.sendHex(code, 0);
     // IR blaster has its own activity LED — no Uno pin needed
 }
@@ -228,12 +271,14 @@ void handleIR(char* hexStr) {
 // ============================================================================
 // RF HANDLER
 //
-// Parses a hex string and sends it as an RF code.
-// Input: "4477265" → rf.sendRaw(0x4477265, 24, 1)
+// Parses a decimal string and sends it as an RF code.
+// Input: "4477265" → rf.sendRaw(4477265, 24, 1)
 // ============================================================================
 
 void handleRF(char* hexStr) {
-    uint32_t code = (uint32_t)strtoul(hexStr, nullptr, 16);
+    // RF codes are decimal (e.g. 4477265, 4477268), not hex.
+    uint32_t code = (uint32_t)strtoul(hexStr, nullptr, 10);
+    setBusy(BUSY_FLASH_MS);   // flash red: RF is transmitting
     rf.sendRaw(code, 24, 1);
     // RF module has its own activity LED — no Uno pin needed
 }
@@ -246,11 +291,16 @@ void handleRF(char* hexStr) {
 // ============================================================================
 
 void setup() {
-    // UART to ESP32 (115200 baud, 8N1)
-    // Bump to 250000 when scaling to 24 lamps
+    // UART to ESP32 (250000 baud, 8N1)
     Serial.begin(250000);
 
-    // Initialize status LEDs (both off initially)
+    // Initialize PINS as outputs and set them LOW
+    
+    pinMode(IR_TRANSMIT_PIN, OUTPUT);
+    pinMode(RF_TRANSMIT_PIN, OUTPUT);
+    digitalWrite(IR_TRANSMIT_PIN, LOW);
+    digitalWrite(RF_TRANSMIT_PIN, LOW);
+    
     pinMode(LED_OK_PIN, OUTPUT);
     pinMode(LED_ERR_PIN, OUTPUT);
     digitalWrite(LED_OK_PIN, LOW);
@@ -270,13 +320,13 @@ void setup() {
         radio.initializeRadio();
         radio.runStartupColorSequence();
         radioReady = true;
-        digitalWrite(LED_OK_PIN, HIGH);   // GREEN solid: all good
+        // Green heartbeat starts in updateLeds(); red stays off.
     } else {
-        digitalWrite(LED_ERR_PIN, HIGH);  // RED solid: CC2500 missing
+        radioReady = false;
+        // Red fast-blink starts in updateLeds(); user can see CC2500 is missing.
     }
 
-    // Schedule first RF test (only relevant when test block is active)
-    lastRfTime = millis() - (RF_INTERVAL_MS - 5000);  // fire after 5 s
+    lastHeartbeatToggle = millis();
 }
 
 // ============================================================================
@@ -286,38 +336,17 @@ void setup() {
 // any received commands. The radio's GDO0 interrupt handles TX timing
 // autonomously — no polling needed here.
 //
+// LEDs are updated every iteration so the heartbeat and busy flashes
+// run without blocking command processing.
+//
 // At 80 Hz lamp frames, each call to receiveCommands() reads ~80 bytes
 // and triggers one sendFrame() (9.6 ms of radio air time).
-// The loop runs ~80 times per second, each iteration taking ~10 ms.
 // ============================================================================
 
 void loop() {
     // Process all pending UART data
     receiveCommands();
 
-    // ------------------------------------------------------------------
-    // RF/IR TEST BLOCK (uncomment for testing, comment out for production)
-    //
-    // Sends a KAKU "on" code every 12 seconds, then "off" after 5 seconds.
-    // Also sends corresponding IR codes.
-    // ------------------------------------------------------------------
-    /*
-    const unsigned long now = millis();
-
-    if (now - lastRfTime >= RF_INTERVAL_MS) {
-        ir.sendHex(0xBF40FF00, 0);   // IR: power button
-        rf.sendRaw(4477265, 24, 1);  // RF: turn on
-        ir.sendHex(0xFD02EF00, 0);   // IR: off button
-
-        rfPendingOff = true;
-        rfOffAt = now + RF_OFF_DELAY_MS;
-        lastRfTime = now;
-    }
-
-    if (rfPendingOff && now >= rfOffAt) {
-        rf.sendRaw(4477268, 24, 1);  // RF: turn off
-        ir.sendHex(0xFC03EF00, 0);   // IR: on button
-        rfPendingOff = false;
-    }
-    */
-}   
+    // Keep status LEDs blinking without blocking.
+    updateLeds();
+}
